@@ -7,12 +7,7 @@ from PIL import Image
 import pytesseract
 import json
 
-# ── Page config ────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="LinguaFlow API",
-    page_icon="🌐",
-    layout="wide"
-)
+st.set_page_config(page_title="LinguaFlow API", page_icon="🌐", layout="wide")
 
 # ── Model map ──────────────────────────────────────────────────────────────
 MODEL_MAP = {
@@ -24,47 +19,43 @@ MODEL_MAP = {
     ("en", "gu"): "Helsinki-NLP/opus-mt-en-gu",
 }
 
-# ── Load model directly (no pipeline — avoids task name issues) ────────────
-@st.cache_resource(show_spinner="Loading translation model…")
+# ── Load MarianMT directly — no pipeline(), works on all transformers versions
+@st.cache_resource(show_spinner="Loading model…")
 def load_model(src: str, tgt: str):
-    model_name = MODEL_MAP.get((src, tgt))
-    if not model_name:
+    name = MODEL_MAP.get((src, tgt))
+    if not name:
         return None, None
-    tokenizer = MarianTokenizer.from_pretrained(model_name)
-    model     = MarianMTModel.from_pretrained(model_name)
-    return tokenizer, model
+    tok = MarianTokenizer.from_pretrained(name)
+    mdl = MarianMTModel.from_pretrained(name)
+    return tok, mdl
 
-# ── Translate function ─────────────────────────────────────────────────────
 def translate(text: str, src: str, tgt: str) -> str:
-    if not text.strip():
-        return ""
-    if src == tgt:
+    if not text.strip() or src == tgt:
         return text
 
-    tokenizer, model = load_model(src, tgt)
-    if tokenizer and model:
-        inputs  = tokenizer(text, return_tensors="pt",
-                            padding=True, truncation=True, max_length=512)
-        outputs = model.generate(**inputs)
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    tok, mdl = load_model(src, tgt)
+    if tok and mdl:
+        batch = tok([text], return_tensors="pt",
+                    padding=True, truncation=True, max_length=512)
+        out = mdl.generate(**batch)
+        return tok.decode(out[0], skip_special_tokens=True)
 
-    # Bridge via English
-    tok_en, mod_en = load_model(src, "en")
-    tok_tg, mod_tg = load_model("en", tgt)
-    if tok_en and mod_en and tok_tg and mod_tg:
-        inp1 = tok_en(text, return_tensors="pt",
-                      padding=True, truncation=True, max_length=512)
-        out1 = mod_en.generate(**inp1)
-        en   = tok_en.decode(out1[0], skip_special_tokens=True)
-        inp2 = tok_tg(en, return_tensors="pt",
-                      padding=True, truncation=True, max_length=512)
-        out2 = mod_tg.generate(**inp2)
-        return tok_tg.decode(out2[0], skip_special_tokens=True)
+    # Bridge via English for unsupported pairs (fr↔hi, fr↔gu, etc.)
+    tok1, mdl1 = load_model(src, "en")
+    tok2, mdl2 = load_model("en", tgt)
+    if tok1 and mdl1 and tok2 and mdl2:
+        b1  = tok1([text], return_tensors="pt", padding=True,
+                   truncation=True, max_length=512)
+        en  = tok1.decode(mdl1.generate(**b1)[0], skip_special_tokens=True)
+        b2  = tok2([en],   return_tensors="pt", padding=True,
+                   truncation=True, max_length=512)
+        return tok2.decode(mdl2.generate(**b2)[0], skip_special_tokens=True)
 
-    return f"[No model available for {src}→{tgt}]"
+    return f"[No model for {src}→{tgt}]"
 
 # ══════════════════════════════════════════════════════════════════════════
-# API MODE  ?api=1&text=bonjour&src=fr&tgt=en
+# API MODE — called by Vercel frontend
+# GET /?api=1&text=bonjour&src=fr&tgt=en
 # ══════════════════════════════════════════════════════════════════════════
 params = st.query_params
 
@@ -83,13 +74,11 @@ if params.get("api") == "1":
     st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════
-# NORMAL UI
+# NORMAL STREAMLIT UI
 # ══════════════════════════════════════════════════════════════════════════
 st.markdown("## 🌐 LinguaFlow — Neural Translation Backend")
-st.caption("MarianMT · Helsinki-NLP · PyTorch · Free · No API key")
+st.caption("MarianMT · Helsinki-NLP · transformers 5.x · Python 3.14 compatible")
 st.divider()
-
-tab1, tab2, tab3 = st.tabs(["📝 Text", "📷 Image OCR", "🔌 API Docs"])
 
 LANGS = {
     "French 🇫🇷":   "fr",
@@ -98,17 +87,22 @@ LANGS = {
     "Gujarati 🇮🇳": "gu",
 }
 
+tab1, tab2, tab3 = st.tabs(["📝 Text", "📷 Image OCR", "🔌 API Docs"])
+
+# ── Tab 1 : Text ────────────────────────────────────────────────────────────
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
-        src_label = st.selectbox("From", list(LANGS.keys()), index=0)
-        src = LANGS[src_label]
-        user_text = st.text_area("Input",
+        src_l = st.selectbox("From", list(LANGS.keys()), index=0)
+        src   = LANGS[src_l]
+        user_text = st.text_area(
+            "Input",
             placeholder="e.g. je me sens affreusement mal",
-            height=180, label_visibility="collapsed")
+            height=180, label_visibility="collapsed"
+        )
     with c2:
-        tgt_label = st.selectbox("To", list(LANGS.keys()), index=1)
-        tgt = LANGS[tgt_label]
+        tgt_l = st.selectbox("To", list(LANGS.keys()), index=1)
+        tgt   = LANGS[tgt_l]
         out_box = st.empty()
 
     if st.button("Translate ⚡", type="primary", use_container_width=True):
@@ -124,7 +118,8 @@ with tab1:
                                       label_visibility="collapsed")
                     st.success("✓ Done!")
                 except Exception as e:
-                    st.error(f"Translation error: {e}")
+                    st.error(f"Error: {e}")
+
             with st.expander("↩ Back-translation check"):
                 with st.spinner("Back-translating…"):
                     try:
@@ -133,14 +128,16 @@ with tab1:
                     except Exception as e:
                         st.error(str(e))
 
+# ── Tab 2 : Image OCR ───────────────────────────────────────────────────────
 with tab2:
-    st.caption("Upload an image containing text — menus, signs, documents")
-    uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png","webp"])
+    st.caption("Upload image containing text — menus, signs, documents")
+    uploaded = st.file_uploader("Upload", type=["jpg","jpeg","png","webp"])
     oc1, oc2 = st.columns(2)
     with oc1:
-        ocr_src_l = st.selectbox("Language in image", list(LANGS.keys()), key="os")
+        ocr_src = st.selectbox("Language in image", list(LANGS.keys()), key="os")
     with oc2:
-        ocr_tgt_l = st.selectbox("Translate to", list(LANGS.keys()), index=1, key="ot")
+        ocr_tgt = st.selectbox("Translate to", list(LANGS.keys()), index=1, key="ot")
+
     if uploaded:
         img = Image.open(uploaded)
         st.image(img, use_column_width=True)
@@ -155,13 +152,14 @@ with tab2:
                 st.code(raw, language=None)
                 with st.spinner("Translating…"):
                     try:
-                        out = translate(raw, LANGS[ocr_src_l], LANGS[ocr_tgt_l])
+                        out = translate(raw, LANGS[ocr_src], LANGS[ocr_tgt])
                         st.success(out)
                     except Exception as e:
                         st.error(str(e))
             else:
-                st.error("No text detected. Try a clearer image.")
+                st.error("No text detected — try a clearer image.")
 
+# ── Tab 3 : API Docs ────────────────────────────────────────────────────────
 with tab3:
     st.markdown("""
 ### 🔌 API Usage
@@ -170,7 +168,6 @@ with tab3:
 GET https://YOUR-APP.streamlit.app/?api=1&text=bonjour&src=fr&tgt=en
 ```
 
-#### Parameters
 | Param | Values | Example |
 |-------|--------|---------|
 | `api` | `1` | enables API mode |
@@ -178,8 +175,17 @@ GET https://YOUR-APP.streamlit.app/?api=1&text=bonjour&src=fr&tgt=en
 | `src` | `fr` `en` `hi` `gu` | `fr` |
 | `tgt` | `fr` `en` `hi` `gu` | `en` |
 
-#### Response
+**Response:**
 ```json
 { "translation": "Hello", "src": "fr", "tgt": "en" }
 ```
+
+**Supported pairs:**
+
+| Pair | Method |
+|------|--------|
+| French ↔ English | Direct |
+| Hindi ↔ English | Direct |
+| Gujarati ↔ English | Direct |
+| French ↔ Hindi/Gujarati | Bridged via English |
     """)
