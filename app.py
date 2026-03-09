@@ -1,10 +1,12 @@
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import streamlit as st
-from transformers import pipeline
+from transformers import MarianMTModel, MarianTokenizer
 from PIL import Image
 import pytesseract
 import json
-import os
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="LinguaFlow API",
@@ -12,72 +14,79 @@ st.set_page_config(
     layout="wide"
 )
 
-# ── CORS helper — returns JSON so the Vercel frontend can call this ─────────
-# Streamlit doesn't support true REST, so we use st.query_params to act
-# like a lightweight API endpoint when called with ?api=1
-params = st.query_params
+# ── Model map ──────────────────────────────────────────────────────────────
+MODEL_MAP = {
+    ("fr", "en"): "Helsinki-NLP/opus-mt-fr-en",
+    ("en", "fr"): "Helsinki-NLP/opus-mt-en-fr",
+    ("hi", "en"): "Helsinki-NLP/opus-mt-hi-en",
+    ("en", "hi"): "Helsinki-NLP/opus-mt-en-hi",
+    ("gu", "en"): "Helsinki-NLP/opus-mt-gu-en",
+    ("en", "gu"): "Helsinki-NLP/opus-mt-en-gu",
+}
 
-# ── Model loader ───────────────────────────────────────────────────────────
+# ── Load model directly (no pipeline — avoids task name issues) ────────────
 @st.cache_resource(show_spinner="Loading translation model…")
-def load_translator(src: str, tgt: str):
-    model_map = {
-        ("fr", "en"): "Helsinki-NLP/opus-mt-fr-en",
-        ("en", "fr"): "Helsinki-NLP/opus-mt-en-fr",
-        ("hi", "en"): "Helsinki-NLP/opus-mt-hi-en",
-        ("en", "hi"): "Helsinki-NLP/opus-mt-en-hi",
-        ("gu", "en"): "Helsinki-NLP/opus-mt-gu-en",
-        ("en", "gu"): "Helsinki-NLP/opus-mt-en-gu",
-        ("fr", "hi"): None,   # bridged
-        ("hi", "fr"): None,   # bridged
-        ("fr", "gu"): None,   # bridged
-        ("gu", "fr"): None,   # bridged
-    }
-    name = model_map.get((src, tgt))
-    if name:
-        return pipeline("translation", model=name, framework="pt")
-    return None
+def load_model(src: str, tgt: str):
+    model_name = MODEL_MAP.get((src, tgt))
+    if not model_name:
+        return None, None
+    tokenizer = MarianTokenizer.from_pretrained(model_name)
+    model     = MarianMTModel.from_pretrained(model_name)
+    return tokenizer, model
 
+# ── Translate function ─────────────────────────────────────────────────────
 def translate(text: str, src: str, tgt: str) -> str:
+    if not text.strip():
+        return ""
     if src == tgt:
         return text
 
-    # Direct pair
-    pipe = load_translator(src, tgt)
-    if pipe:
-        return pipe(text, max_length=512)[0]["translation_text"]
+    tokenizer, model = load_model(src, tgt)
+    if tokenizer and model:
+        inputs  = tokenizer(text, return_tensors="pt",
+                            padding=True, truncation=True, max_length=512)
+        outputs = model.generate(**inputs)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     # Bridge via English
-    to_en   = load_translator(src, "en")
-    from_en = load_translator("en", tgt)
-    if to_en and from_en:
-        en_text = to_en(text, max_length=512)[0]["translation_text"]
-        return from_en(en_text, max_length=512)[0]["translation_text"]
+    tok_en, mod_en = load_model(src, "en")
+    tok_tg, mod_tg = load_model("en", tgt)
+    if tok_en and mod_en and tok_tg and mod_tg:
+        inp1 = tok_en(text, return_tensors="pt",
+                      padding=True, truncation=True, max_length=512)
+        out1 = mod_en.generate(**inp1)
+        en   = tok_en.decode(out1[0], skip_special_tokens=True)
+        inp2 = tok_tg(en, return_tensors="pt",
+                      padding=True, truncation=True, max_length=512)
+        out2 = mod_tg.generate(**inp2)
+        return tok_tg.decode(out2[0], skip_special_tokens=True)
 
-    return f"[No model for {src}→{tgt}]"
+    return f"[No model available for {src}→{tgt}]"
 
 # ══════════════════════════════════════════════════════════════════════════
-# API MODE — called by Vercel frontend via ?api=1&text=...&src=fr&tgt=en
+# API MODE  ?api=1&text=bonjour&src=fr&tgt=en
 # ══════════════════════════════════════════════════════════════════════════
+params = st.query_params
+
 if params.get("api") == "1":
     text = params.get("text", "")
     src  = params.get("src", "fr")
     tgt  = params.get("tgt", "en")
-
     if text:
-        result = translate(text, src, tgt)
-        # Render as raw JSON in a code block Vercel can scrape
-        st.markdown("```json")
-        st.markdown(json.dumps({"translation": result, "src": src, "tgt": tgt}))
-        st.markdown("```")
+        try:
+            result = translate(text, src, tgt)
+            st.json({"translation": result, "src": src, "tgt": tgt})
+        except Exception as e:
+            st.json({"error": str(e)})
     else:
-        st.markdown(json.dumps({"error": "No text provided"}))
-    st.stop()   # Don't render the rest of the UI
+        st.json({"error": "No text provided"})
+    st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════
-# NORMAL STREAMLIT UI
+# NORMAL UI
 # ══════════════════════════════════════════════════════════════════════════
 st.markdown("## 🌐 LinguaFlow — Neural Translation Backend")
-st.caption("Helsinki-NLP Opus-MT · PyTorch · Free · No API key")
+st.caption("MarianMT · Helsinki-NLP · PyTorch · Free · No API key")
 st.divider()
 
 tab1, tab2, tab3 = st.tabs(["📝 Text", "📷 Image OCR", "🔌 API Docs"])
@@ -89,14 +98,14 @@ LANGS = {
     "Gujarati 🇮🇳": "gu",
 }
 
-# ── Tab 1 : Text ────────────────────────────────────────────────────────────
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
         src_label = st.selectbox("From", list(LANGS.keys()), index=0)
         src = LANGS[src_label]
-        user_text = st.text_area("Input", placeholder="Type here…", height=180,
-                                 label_visibility="collapsed")
+        user_text = st.text_area("Input",
+            placeholder="e.g. je me sens affreusement mal",
+            height=180, label_visibility="collapsed")
     with c2:
         tgt_label = st.selectbox("To", list(LANGS.keys()), index=1)
         tgt = LANGS[tgt_label]
@@ -104,29 +113,34 @@ with tab1:
 
     if st.button("Translate ⚡", type="primary", use_container_width=True):
         if not user_text.strip():
-            st.warning("Enter some text first.")
+            st.warning("Please enter some text first.")
         elif src == tgt:
-            st.warning("Source and target are the same.")
+            st.warning("Source and target languages are the same.")
         else:
             with st.spinner("Translating…"):
-                res = translate(user_text.strip(), src, tgt)
-            out_box.text_area("Result", value=res, height=180,
-                              label_visibility="collapsed")
-            st.success("✓ Done!")
+                try:
+                    res = translate(user_text.strip(), src, tgt)
+                    out_box.text_area("Result", value=res, height=180,
+                                      label_visibility="collapsed")
+                    st.success("✓ Done!")
+                except Exception as e:
+                    st.error(f"Translation error: {e}")
             with st.expander("↩ Back-translation check"):
-                with st.spinner():
-                    back = translate(res, tgt, src)
-                st.info(back)
+                with st.spinner("Back-translating…"):
+                    try:
+                        back = translate(res, tgt, src)
+                        st.info(f"**Back-translated:** {back}")
+                    except Exception as e:
+                        st.error(str(e))
 
-# ── Tab 2 : Image OCR ───────────────────────────────────────────────────────
 with tab2:
+    st.caption("Upload an image containing text — menus, signs, documents")
     uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png","webp"])
     oc1, oc2 = st.columns(2)
     with oc1:
         ocr_src_l = st.selectbox("Language in image", list(LANGS.keys()), key="os")
     with oc2:
-        ocr_tgt_l = st.selectbox("Translate to",      list(LANGS.keys()), index=1, key="ot")
-
+        ocr_tgt_l = st.selectbox("Translate to", list(LANGS.keys()), index=1, key="ot")
     if uploaded:
         img = Image.open(uploaded)
         st.image(img, use_column_width=True)
@@ -140,17 +154,17 @@ with tab2:
             if raw:
                 st.code(raw, language=None)
                 with st.spinner("Translating…"):
-                    out = translate(raw, LANGS[ocr_src_l], LANGS[ocr_tgt_l])
-                st.success(out)
+                    try:
+                        out = translate(raw, LANGS[ocr_src_l], LANGS[ocr_tgt_l])
+                        st.success(out)
+                    except Exception as e:
+                        st.error(str(e))
             else:
                 st.error("No text detected. Try a clearer image.")
 
-# ── Tab 3 : API Docs ────────────────────────────────────────────────────────
 with tab3:
     st.markdown("""
-### 🔌 Using LinguaFlow as an API
-
-Your Vercel frontend calls this Streamlit app with query parameters:
+### 🔌 API Usage
 
 ```
 GET https://YOUR-APP.streamlit.app/?api=1&text=bonjour&src=fr&tgt=en
@@ -161,36 +175,11 @@ GET https://YOUR-APP.streamlit.app/?api=1&text=bonjour&src=fr&tgt=en
 |-------|--------|---------|
 | `api` | `1` | enables API mode |
 | `text` | any string | `bonjour` |
-| `src`  | `fr` `en` `hi` `gu` | `fr` |
-| `tgt`  | `fr` `en` `hi` `gu` | `en` |
+| `src` | `fr` `en` `hi` `gu` | `fr` |
+| `tgt` | `fr` `en` `hi` `gu` | `en` |
 
 #### Response
 ```json
 { "translation": "Hello", "src": "fr", "tgt": "en" }
-```
-
-#### Supported Pairs
-| From | To | Method |
-|------|----|--------|
-| French | English | Direct |
-| English | French | Direct |
-| Hindi | English | Direct |
-| English | Hindi | Direct |
-| Gujarati | English | Direct |
-| English | Gujarati | Direct |
-| French ↔ Hindi | — | Bridged via English |
-| French ↔ Gujarati | — | Bridged via English |
-
-#### Example JavaScript (for your Vercel app)
-```javascript
-async function translateViaStreamlit(text, src, tgt) {
-  const base = "https://YOUR-APP.streamlit.app/";
-  const url  = `${base}?api=1&text=${encodeURIComponent(text)}&src=${src}&tgt=${tgt}`;
-  const res  = await fetch(url);
-  const html = await res.text();
-  const match = html.match(/\\{"translation".*?\\}/);
-  if (match) return JSON.parse(match[0]).translation;
-  return null;
-}
 ```
     """)
